@@ -5,21 +5,29 @@ using System.Threading.Tasks;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using System.Text.RegularExpressions;
+using System.IO;
+using System.Text.Json;
 
 namespace SwiftAnalyzer.Core.Services.ML
 {
     public class DeBertaModel : IDisposable
     {
-        private readonly InferenceSession session;
-        private readonly DeBertaTokenizer tokenizer;
+        private readonly InferenceSession modelSession;
+        private readonly InferenceSession tokenizerSession;
+        private readonly Dictionary<string, int> vocab;
         private const int MaxLength = 512;
 
-        public DeBertaModel(string modelPath)
+        public DeBertaModel(string modelPath, string tokenizerPath, string vocabPath)
         {
+            // Charger le vocabulaire
+            vocab = JsonSerializer.Deserialize<Dictionary<string, int>>(File.ReadAllText(vocabPath));
+
+            // Initialiser les sessions ONNX
             var sessionOptions = new SessionOptions();
             sessionOptions.AppendExecutionProvider_CPU();
-            session = new InferenceSession(modelPath, sessionOptions);
-            tokenizer = new DeBertaTokenizer();
+            
+            modelSession = new InferenceSession(modelPath, sessionOptions);
+            tokenizerSession = new InferenceSession(tokenizerPath, sessionOptions);
         }
 
         public async Task<SwiftAnalysisResult> AnalyzeSwiftMessage(string text)
@@ -28,17 +36,17 @@ namespace SwiftAnalyzer.Core.Services.ML
 
             // 1. Détecter les types d'opérations principaux
             var mainTypes = await ClassifyZeroShot(text, SwiftClassificationExamples.GetMainOperationTypes());
-            result.MainOperationType = mainTypes.First().Label;
+            result.MainOperationType = mainTypes.First().Item1;
 
             // 2. Détecter les conditions et dépendances
             var conditions = await ClassifyZeroShot(text, SwiftClassificationExamples.GetConditionTypes());
-            var significantConditions = conditions.Where(c => c.Score > 0.3).ToList();
+            var significantConditions = conditions.Where(c => c.Item2 > 0.3).ToList();
             result.HasConditions = significantConditions.Any();
             result.Conditions = significantConditions;
 
             // 3. Détecter les dates et délais
             var timeConstraints = await ClassifyZeroShot(text, SwiftClassificationExamples.GetTimeConstraints());
-            result.TimeConstraints = timeConstraints.Where(t => t.Score > 0.3).ToList();
+            result.TimeConstraints = timeConstraints.Where(t => t.Item2 > 0.3).ToList();
 
             // 4. Analyser les sous-parties du message
             var sentences = text.Split(new[] { '.', '!', '?' }, StringSplitOptions.RemoveEmptyEntries)
@@ -49,14 +57,14 @@ namespace SwiftAnalyzer.Core.Services.ML
             foreach (var sentence in sentences)
             {
                 var subTasks = await ClassifyZeroShot(sentence, SwiftClassificationExamples.GetSubTaskTypes());
-                var significantTasks = subTasks.Where(t => t.Score > 0.4).ToList();
+                var significantTasks = subTasks.Where(t => t.Item2 > 0.4).ToList();
                 if (significantTasks.Any())
                 {
                     result.SubTasks.Add(new SubTask 
                     { 
                         Text = sentence,
-                        Type = significantTasks.First().Label,
-                        Confidence = significantTasks.First().Score,
+                        Type = significantTasks.First().Item1,
+                        Confidence = significantTasks.First().Item2,
                         RelatedTasks = significantTasks.Skip(1).ToList()
                     });
                 }
@@ -66,40 +74,52 @@ namespace SwiftAnalyzer.Core.Services.ML
         }
 
         public async Task<List<(string Label, float Score)>> ClassifyZeroShot(
-            string text,
+            string premise,
             Dictionary<string, string> labelHypotheses)
         {
             var results = new List<(string Label, float Score)>();
 
             foreach (var (label, hypothesis) in labelHypotheses)
             {
-                var inputText = $"{text}</s>{hypothesis}";
-                var (inputIds, attentionMask) = tokenizer.Encode(inputText, MaxLength);
-
-                var inputTensor = new DenseTensor<long>(new[] { 1, inputIds.Length });
-                var maskTensor = new DenseTensor<long>(new[] { 1, attentionMask.Length });
-
-                for (int i = 0; i < inputIds.Length; i++)
-                {
-                    inputTensor[0, i] = inputIds[i];
-                    maskTensor[0, i] = attentionMask[i];
-                }
+                // Tokenize using ONNX tokenizer
+                var tokenized = Tokenize(premise, hypothesis);
 
                 var inputs = new List<NamedOnnxValue>
                 {
-                    NamedOnnxValue.CreateFromTensor("input_ids", inputTensor),
-                    NamedOnnxValue.CreateFromTensor("attention_mask", maskTensor)
+                    NamedOnnxValue.CreateFromTensor("input_ids", tokenized.InputIds),
+                    NamedOnnxValue.CreateFromTensor("attention_mask", tokenized.AttentionMask)
                 };
 
-                using var outputs = session.Run(inputs);
+                // Run inference
+                using var outputs = modelSession.Run(inputs);
                 var logits = outputs.First(x => x.Name == "logits").AsTensor<float>();
                 var probabilities = Softmax(logits.ToArray());
 
-                results.Add((label, probabilities[1]));
+                // For zero-shot NLI, we use the "entailment" score (index 0)
+                results.Add((label, probabilities[0]));
             }
 
-            var sum = results.Sum(r => r.Score);
-            return results.Select(r => (r.Label, r.Score / sum)).OrderByDescending(r => r.Score).ToList();
+            var sum = results.Sum(r => r.Item2);
+            return results.Select(r => (r.Label, r.Item2 / sum)).OrderByDescending(r => r.Item2).ToList();
+        }
+
+        private (DenseTensor<long> InputIds, DenseTensor<long> AttentionMask) Tokenize(string premise, string hypothesis)
+        {
+            // Préparer les entrées pour le tokenizer ONNX
+            var inputs = new List<NamedOnnxValue>
+            {
+                NamedOnnxValue.CreateFromTensor("premise", new DenseTensor<string>(new[] { premise }, new[] { 1 })),
+                NamedOnnxValue.CreateFromTensor("hypothesis", new DenseTensor<string>(new[] { hypothesis }, new[] { 1 }))
+            };
+
+            // Exécuter le tokenizer
+            using var outputs = tokenizerSession.Run(inputs);
+
+            // Récupérer les tenseurs de sortie
+            var inputIds = outputs.First(x => x.Name == "input_ids").AsTensor<long>();
+            var attentionMask = outputs.First(x => x.Name == "attention_mask").AsTensor<long>();
+
+            return (inputIds, attentionMask);
         }
 
         private float[] Softmax(float[] logits)
@@ -112,14 +132,15 @@ namespace SwiftAnalyzer.Core.Services.ML
 
         public void Dispose()
         {
-            session?.Dispose();
+            modelSession?.Dispose();
+            tokenizerSession?.Dispose();
         }
     }
 
     public class SwiftAnalysisResult
     {
-        public string OriginalText { get; set; }
-        public string MainOperationType { get; set; }
+        public string OriginalText { get; set; } = "";
+        public string MainOperationType { get; set; } = "";
         public bool HasConditions { get; set; }
         public List<(string Label, float Score)> Conditions { get; set; } = new();
         public List<(string Label, float Score)> TimeConstraints { get; set; } = new();
@@ -128,8 +149,8 @@ namespace SwiftAnalyzer.Core.Services.ML
 
     public class SubTask
     {
-        public string Text { get; set; }
-        public string Type { get; set; }
+        public string Text { get; set; } = "";
+        public string Type { get; set; } = "";
         public float Confidence { get; set; }
         public List<(string Label, float Score)> RelatedTasks { get; set; } = new();
     }

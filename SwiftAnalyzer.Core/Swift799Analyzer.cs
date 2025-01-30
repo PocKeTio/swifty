@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using SwiftAnalyzer.Core.Models;
 using SwiftAnalyzer.Core.Services.ML;
+using SubTask = SwiftAnalyzer.Core.Models.SubTask;
 
 namespace SwiftAnalyzer.Core
 {
@@ -12,9 +13,9 @@ namespace SwiftAnalyzer.Core
         private readonly DeBertaModel _model;
         private readonly bool _extractNarrativeOnly;
 
-        public Swift799Analyzer(string modelPath, bool extractNarrativeOnly = false)
+        public Swift799Analyzer(string modelPath, string tokenizerPath, string vocabPath, bool extractNarrativeOnly = false)
         {
-            _model = new DeBertaModel(modelPath);
+            _model = new DeBertaModel(modelPath, tokenizerPath, vocabPath);
             _extractNarrativeOnly = extractNarrativeOnly;
         }
 
@@ -36,22 +37,23 @@ namespace SwiftAnalyzer.Core
 
             foreach (var subTask in analysis.SubTasks)
             {
-                message.SubTasks.Add(new MessageTask
+                message.SubTasks.Add(new SubTask
                 {
                     Type = subTask.Type,
                     Text = subTask.Text,
-                    Confidence = subTask.Confidence
+                    Confidence = subTask.Confidence,
+                    RelatedTasks = subTask.RelatedTasks
                 });
             }
 
             foreach (var timeConstraint in analysis.TimeConstraints)
             {
-                if (timeConstraint.Score > 0.3)
+                if (timeConstraint.Item2 > 0.3)
                 {
                     message.TimeConstraints.Add(new TimeConstraint
                     {
-                        Type = timeConstraint.Label,
-                        Confidence = timeConstraint.Score
+                        Type = timeConstraint.Item1,
+                        Confidence = timeConstraint.Item2
                     });
                 }
             }
@@ -59,42 +61,24 @@ namespace SwiftAnalyzer.Core
             return message;
         }
 
-        private string ExtractNarrativePart(string swift799Message)
+        private string ExtractNarrativePart(string messageText)
         {
-            try
+            // Recherche de la partie narrative après les en-têtes et codes
+            var narrativeMatch = Regex.Match(messageText, @"(?:^|\n)\s*77E:?\s*(.+?)(?:\n|$)", RegexOptions.Singleline);
+            if (narrativeMatch.Success)
             {
-                // Patterns courants pour identifier la partie narrative
-                var patterns = new[]
-                {
-                    @"77E:.*?}\r?\n(.*?)(?=-|}|$)",  // Cherche après 77E jusqu'à la fin ou un délimiteur
-                    @"Narrative:(.*?)(?=-|}|$)",      // Cherche après "Narrative:" 
-                    @"79:.*?\r?\n(.*?)(?=-|}|$)"     // Cherche après le champ 79
-                };
-
-                foreach (var pattern in patterns)
-                {
-                    var match = Regex.Match(swift799Message, pattern, RegexOptions.Singleline);
-                    if (match.Success && match.Groups.Count > 1)
-                    {
-                        var narrative = match.Groups[1].Value.Trim();
-                        if (!string.IsNullOrWhiteSpace(narrative))
-                        {
-                            // Nettoyer le texte
-                            narrative = Regex.Replace(narrative, @"\r?\n", " ");  // Remplacer les sauts de ligne
-                            narrative = Regex.Replace(narrative, @"\s+", " ");    // Normaliser les espaces
-                            return narrative;
-                        }
-                    }
-                }
-
-                // Si aucun pattern ne correspond, retourner le message complet
-                return swift799Message;
+                return narrativeMatch.Groups[1].Value.Trim();
             }
-            catch (Exception)
+
+            // Si pas de champ 77E, chercher après le dernier champ numéroté
+            var lastFieldMatch = Regex.Match(messageText, @"(?:^|\n)\s*\d{2}[A-Z]:?\s*(.+?)(?:\n|$)", RegexOptions.Singleline | RegexOptions.RightToLeft);
+            if (lastFieldMatch.Success)
             {
-                // En cas d'erreur, retourner le message complet
-                return swift799Message;
+                return lastFieldMatch.Groups[1].Value.Trim();
             }
+
+            // Si aucun format reconnu, retourner le texte complet
+            return messageText.Trim();
         }
 
         public void Dispose()
